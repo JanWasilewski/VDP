@@ -5,30 +5,33 @@ import torchvision.datasets as datasets
 
 import wandb
 
+from layers import MySoftmax
 from models import VGG11_224, VDP_VGG11_224
-from utils import mc_nll, dirichlet_loss
+from utils_vdp import mc_nll, dirichlet_loss, gaussian_loss
 
 torch._functorch.config.donated_buffer = False
 
 # Initialize Weights & Biases
 
-lr=0.0005
-kl_factor = 0.00001
+lr=0.0001
+kl_factor = 0.000001
 EPOCHS = 250
 batch_size = 64
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
 config = {
     "learning_rate": lr,
-    "loss_function": "mc_nll",
+    "loss_function": "nll",
     "kl_factor": kl_factor,
     "architecture": "VGG11_224",
     "epochs": EPOCHS,
     "batch_size": batch_size,
     "train_dataset": "Food101",
+    "device": device,
 }
 wandb.init(name="mc_nll", project="VGG11_224x224", config=config) # Replace with your project name
 
 
-device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
 
 # Instantiate the model
 model_vdp = VDP_VGG11_224(num_classes=101).to(device)
@@ -68,7 +71,8 @@ for epoch in range(EPOCHS):
 
         # Forward pass
         mu, sigma, kl = model_vdp(images)
-        loss1 = mc_nll(labels, mu, sigma)
+        mu, sigma = MySoftmax()(mu, sigma)
+        loss1 = mc_nll(mu, sigma, labels)
         loss = loss1 + kl_factor * kl
         # Backward and optimize
         optimizer.zero_grad()
@@ -90,8 +94,8 @@ for epoch in range(EPOCHS):
         test_images = test_images.to(device)
         test_labels = test_labels.to(device)
         test_outputs, test_sigmas, kl = model_vdp(test_images)
-
-        test_loss += mc_nll(test_labels, test_outputs, test_sigmas).detach().item() * batch_size
+        test_outputs, test_sigmas = MySoftmax()(test_outputs, test_sigmas)
+        test_loss += mc_nll(test_outputs, test_sigmas, test_labels).detach().item() * batch_size
         test_kl += kl.cpu().item() * batch_size
         test_accuracy += (test_outputs.argmax(dim=1) == test_labels).float().sum().cpu().item()
         test_average_sigma += test_sigmas.mean(1).sum().cpu().item()
@@ -118,6 +122,5 @@ for epoch in range(EPOCHS):
     })
 
     if (epoch+1)%50  == 0:
-        torch.save(model_vdp.state_dict(), f'vggm11_vdp_{epoch+1}_dirichlet.pth')
-torch.save(model_vdp.state_dict(), 'vggm11_vdp_200_dirichlet.pth')
+        torch.save(model_vdp.state_dict(), f'vggm11_vdp_{epoch+1}_mc_2.pth')
 

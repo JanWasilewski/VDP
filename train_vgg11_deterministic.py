@@ -12,7 +12,7 @@ torch._functorch.config.donated_buffer = False
 
 # Initialize Weights & Biases
 EPOCHS = 250
-lr = 0.001
+lr = 0.0005
 batch_size=128
 
 config = {

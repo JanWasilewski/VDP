@@ -1,9 +1,19 @@
 import torch
 import torch.nn.functional as F
-
 # -------------------- LOSS FUNCTIONS -------------------
-def mc_nll(y_gt, mu, sigma, num_samples=10):
-    samples = mu.unsqueeze(1) + sigma.unsqueeze(1) * torch.randn(mu.size(0), num_samples, mu.size(1), device=mu.device)
+
+def gaussian_loss(mu, sigma, targets):
+    targets = F.one_hot(targets.long().view(-1), num_classes= mu.shape[1]).float()
+    sigma = torch.clamp(sigma, min=1e-6)  
+    precision = 1.0 / sigma
+    loss1 = ((targets - mu) ** 2 * precision)
+    loss2 = torch.log(sigma)
+    loss = 0.5 * (loss1 + loss2).sum(dim=1)
+    return loss.mean()
+
+
+def mc_nll(mu, sigma, y_gt, num_samples=10):
+    samples = mu.unsqueeze(1) + torch.sqrt(sigma.unsqueeze(1)) * torch.randn(mu.size(0), num_samples, mu.size(1), device=mu.device)
     probs = F.softmax(samples, dim=-1)  # [B, S, C]
     y_onehot = F.one_hot(y_gt, num_classes=mu.size(1)).float()  # [B, C]
     y_onehot = y_onehot.unsqueeze(1)  # [B, 1, C]
@@ -12,7 +22,41 @@ def mc_nll(y_gt, mu, sigma, num_samples=10):
     nll = -log_probs.mean()  
     return nll
 
-def dirichlet_loss(targets, mu, sigma, eps=1e-8):
+
+def dirichlet_loss(mu, sigma, targets, eps=1e-8, lambda_reg=0.01):
+    """
+    mu: [B, C] - predicted mean logits
+    sigma: [B, C] - predicted variance logits (uncertainty)
+    targets: [B] - ground truth labels
+    lambda_reg: regularization weight
+    """
+
+    # Better evidence calculation - inversely related to uncertainty
+    evidence = mu / (sigma + eps)  # [B, C]
+    
+    # Dirichlet concentration parameters 
+    alpha = evidence + 1  # avoid zero concentration
+    
+    # Compute alpha_0 (sum of all alpha parameters)
+    alpha_0 = torch.sum(alpha, dim=1)  # [B]
+    
+    # Get target alphas
+    target_oh = F.one_hot(targets, num_classes=mu.size(1)).float()  # [B, C]
+    alpha_target = torch.sum(alpha * target_oh, dim=1)  # [B]
+    
+    # Main loss term - simplified approximation of Dirichlet negative log-likelihood
+    main_loss = torch.log(alpha_0) - torch.log(alpha_target)
+    
+    # Regularization term to encourage low uncertainty for predicted class
+    reg_loss = lambda_reg * torch.sum(mu * sigma, dim=1)
+
+    # Total loss
+    loss = main_loss + reg_loss
+    
+    return loss.mean()
+
+
+def dirichlet_loss_old(targets, mu, sigma, eps=1e-8):
     """
     mu: [B, C] - predicted mean logits
     sigma: [B, C] - predicted variance logits (uncertainty)

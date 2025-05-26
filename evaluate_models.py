@@ -3,36 +3,227 @@ from sklearn.metrics import precision_recall_curve, auc, roc_curve, roc_auc_scor
 from layers import MySoftmax
 import numpy as np
 import torch
-
+from torch.utils.data import DataLoader, Subset
+import time
+import random
 
 # Evaluate on OOD and adversarial attacks
 # -------- OOD --------
 # - AUROC
 # - AUPR
 # - FPR95
+# -------- Calibration --------
 # - ECE
+# - Brier
 # -------- Adversarial --------
 # - Gaussian noise
 # - FGSM
 # - PGD
 
-def compare_two_models(model, vdp_model, id_loader, ood_loader, device="cpu"):
-        model = model.to(device)
-        model_vdp = vdp_model.to(device)
-        print("Evaluating models")
-        results = evaluate_ood(model, id_loader, ood_loader, vdp=False, device=device)
-        print("Evaluating VDP model")
-        results_vdp = evaluate_ood(vdp_model, id_loader, ood_loader, vdp=True, device=device)
-        print("Evaluating calibration")
-        ece, brier = get_calibration(model, id_loader, vdp=False, device=device)
-        ece_vdp, brier_vdp = get_calibration(vdp_model, id_loader, vdp=True, device=device)
-        print("Evaluating Gaussian noise")
-        gaussian_noise = evaluate_with_gaussian_noise(model, id_loader, vdp=False, device=device)
-        gaussian_noise_vdp = evaluate_with_gaussian_noise(vdp_model, id_loader, vdp=True, device=device)
-        # fgsm, fgsm_vdp = evaluate_with_fgsm(model, model_vdp, id_loader)
-        # pgd, pgd_vdp = evaluate_with_pgd(model, model_vdp, id_loader)
+def compare_models(models, id_loader, ood_loader, deterministic_idxs=[], noise_strengths=[0.01], device="cpu"):
+        ood_list = []
+        calibration_list = []
+        gaussian_noise_list = []
 
-        print( results, results_vdp, f"ece {ece}, ece vdp: {ece_vdp}, brier {brier}, brier vdp: {brier_vdp}", gaussian_noise, gaussian_noise_vdp)
+        for m in models:
+            m.eval()
+
+        for idx, model in enumerate(models):
+            model = model.to(device)
+            vdp = idx not in deterministic_idxs
+            results = evaluate_ood(model, id_loader, ood_loader, vdp=vdp, device=device)
+            ece, brier = get_calibration(model, id_loader, vdp=vdp, device=device)
+            gaussian_noise = evaluate_with_gaussian_noise(model, id_loader, vdp=vdp, noise_strengths=noise_strengths, device=device)
+            ood_list.append(results)
+            calibration_list.append((ece, brier))
+            gaussian_noise_list.append(gaussian_noise)
+            print(f"finished evaluation of {idx}th model")
+        fgsm_list = evaluate_with_adversarial_samples(models, id_loader, deterministic_idxs, noise_strengths=noise_strengths, attack_type="fgsm", device=device)
+        pgd_list = evaluate_with_adversarial_samples(models, id_loader, deterministic_idxs, noise_strengths=noise_strengths, attack_type="pgd", device=device)
+        return ood_list, calibration_list, gaussian_noise_list, fgsm_list, pgd_list
+
+def evaluate_with_adversarial_samples(
+    models,
+    id_loader,
+    deterministic_idxs,
+    noise_strengths,
+    num_to_attack=2000,
+    batch_size=64,
+    max_trials=5,
+    attack_type='fgsm', 
+    pgd_steps=10, 
+    pgd_step_size=None,
+    device="cpu",
+    clip_min=0.0,
+    clip_max=1.0,
+):
+    """
+    For each ε in noise_strengths:
+      1) Efficiently find num_to_attack points from id_loader.dataset that *all* models 
+         classify correctly on the clean input.
+      2) For each model, craft FGSM adversarial examples at strength ε
+      3) Test each model against adversarial examples from all models
+      4) Measure the fraction of those points whose predicted label remains correct.
+    
+    Args:
+        models: List of models to evaluate
+        id_loader: DataLoader containing the dataset
+        deterministic_idxs: Indices of deterministic models (vs. probabilistic ones)
+        noise_strengths: List of epsilon values for FGSM attack
+        num_to_attack: Number of samples to attack
+        batch_size: Batch size for evaluation
+        max_trials: Maximum number of trials to find common correct samples
+        device: Device to run evaluation on
+        clip_min: Minimum value for input clipping
+        clip_max: Maximum value for input clipping
+        
+    Returns:
+      A dictionary of dictionaries:
+      { ε: {
+          'robustness': [
+              [model0_vs_adv0, model0_vs_adv1, ...],
+              [model1_vs_adv0, model1_vs_adv1, ...],
+              ...
+          ]
+      }}
+    """
+    criterion = torch.nn.CrossEntropyLoss()
+    dataset = id_loader.dataset
+    results = {}
+    
+    for eps in noise_strengths:
+        common_correct_indices = find_common_correct_indices(
+            models, dataset, deterministic_idxs, num_to_attack, 
+            batch_size, max_trials, device
+        )
+        
+        print(f"ε={eps:.3f}: selected {len(common_correct_indices)} samples")
+        
+        # --- 2) Generate adversarial examples from each model and test cross-model robustness ---
+        attack_subset = Subset(dataset, common_correct_indices)
+        attack_loader = DataLoader(attack_subset, batch_size=batch_size, shuffle=False)
+        
+        cross_robust_counts = [[0 for _ in models] for _ in models]  # model i vs adversarial from j
+        total_samples = 0
+        
+        for X, y in attack_loader:
+            X, y = X.to(device), y.to(device)
+            batch_size_actual = X.size(0)  # Handle last batch potentially smaller
+            total_samples += batch_size_actual
+            
+            # If we allow misclassified exaples in the future
+            # clean_preds = []
+            # for idx, model in enumerate(models):
+            #     with torch.no_grad():
+            #         out = model(X) if idx in deterministic_idxs else model(X)[0]
+            #         clean_preds.append(out.argmax(dim=1))
+            
+
+            all_adv_examples = []
+            for idx, model in enumerate(models):
+                X_adv = X.clone().detach().requires_grad_(True)
+                if attack_type.lower() == 'fgsm':
+                    # single‐step
+                    X_adv.requires_grad_(True)
+                    for m in models: m.zero_grad()
+                    out = model(X_adv) if idx in deterministic_idxs else model(X_adv)[0]
+                    loss = criterion(out, y)
+                    loss.backward()
+
+                    with torch.no_grad():
+                        X_adv = X_adv + eps * X_adv.grad.sign()
+                        X_adv = torch.clamp(X_adv, clip_min, clip_max)
+
+                elif attack_type.lower() == 'pgd':
+                    alpha = pgd_step_size or (eps / pgd_steps)
+                    X_adv = X_adv.requires_grad_(True)
+                    for step in range(pgd_steps):
+                        for m in models: m.zero_grad()
+                        out = model(X_adv) if idx in deterministic_idxs else model(X_adv)[0]
+                        loss = criterion(out, y)
+                        loss.backward()
+
+                        with torch.no_grad(): # project back into the ball of radius eps around X
+                            X_adv = X_adv + alpha * X_adv.grad.sign()
+                            delta = torch.clamp(X_adv - X, min=-eps, max=eps)
+                            X_adv = torch.clamp(X + delta, clip_min, clip_max)
+                        X_adv = X_adv.detach().requires_grad_()
+                        
+
+                else:
+                    raise ValueError(f"Unknown attack_type: {attack_type!r}")
+
+                all_adv_examples.append(X_adv.detach().cpu())
+            
+            # Test each model against all adversarial examples
+            for target_idx, model in enumerate(models):
+                for source_idx, X_adv in enumerate(all_adv_examples):
+                    X_adv = X_adv.to(device)
+                    out_adv = model(X_adv) if target_idx in deterministic_idxs else model(X_adv)[0]
+                    preds_adv = out_adv.argmax(dim=1)
+                    correct = (preds_adv == y).sum().item() # Counts where prediction matches ground truth (true robustness)
+                    cross_robust_counts[target_idx][source_idx] += correct
+    
+        cross_robust_accs = [[count / total_samples for count in row] for row in cross_robust_counts]
+        results[eps] = {'robustness': cross_robust_accs}
+    return results
+
+def find_common_correct_indices(
+    models, dataset, deterministic_idxs, num_needed, 
+    batch_size, max_trials, device
+):
+    """
+    Efficiently find indices of samples that all models classify correctly.
+    
+    Args:
+        models: List of models
+        dataset: The dataset to sample from
+        deterministic_idxs: Indices of deterministic models
+        num_needed: Number of samples needed
+        batch_size: Batch size for processing
+        max_trials: Maximum number of trials to attempt
+        device: Device to use
+        
+    Returns:
+        List of indices of commonly correct samples
+    """
+    all_indices = list(range(len(dataset)))
+    common_correct = set()
+    
+    for trial in range(max_trials):
+        if len(common_correct) >= num_needed:
+            break
+        remaining = num_needed - len(common_correct)
+        sample_size = min(remaining * 2, len(all_indices) - len(common_correct)) # Sample twice as many as we need to increase chances of finding enough
+        available_indices = list(set(all_indices) - common_correct)              # Sample from indices we haven't tried yet
+        if not available_indices:
+            break
+        candidates = random.sample(available_indices, sample_size)
+        subset = Subset(dataset, candidates)
+        loader = DataLoader(subset, batch_size=batch_size, shuffle=False)
+        correct_by_model = [set() for _ in models]
+        
+        for batch_idx, (X, y) in enumerate(loader):
+            X, y = X.to(device), y.to(device)
+            base_idx = batch_idx * batch_size
+            for model_idx, model in enumerate(models):
+                out = model(X) if model_idx in deterministic_idxs else model(X)[0]
+                preds = out.argmax(dim=1)
+                for i, (pred, label) in enumerate(zip(preds, y)):
+                    if pred.item() == label.item():
+                        if base_idx + i < len(candidates):  # Guard against batch size issues
+                            correct_by_model[model_idx].add(candidates[base_idx + i])
+        
+        newly_correct = set.intersection(*correct_by_model) # intersection of all correct sets
+        common_correct.update(newly_correct)
+        print(f"Trial {trial+1}: Found {len(newly_correct)} new common correct samples, "
+              f"total: {len(common_correct)}/{num_needed}")
+    if len(common_correct) < num_needed:
+        print(f"Warning: Could only find {len(common_correct)} common correct samples "
+              f"after {max_trials} trials, requested {num_needed}")
+    
+    return list(common_correct)[:num_needed]
+
 
 def evaluate_with_gaussian_noise(model, id_loader, vdp=True, noise_strengths=[0.01, 0.05, 0.1], device="cpu"):
     ''' Counts the number of predictions that do NOT change under Gaussian noise'''
@@ -62,7 +253,7 @@ def get_calibration(model, id_loader, vdp=False, n_bins=15, device="cpu"):
     # for the Brier score
     total_brier = 0.0
     total_samples = 0
-    num_classes = 1000# len(torch.unique(torch.tensor([label for _, label in id_loader.dataset])))
+    num_classes = len(torch.unique(torch.tensor([label for _, label in id_loader.dataset])))
 
     # for the ECE
     bin_boundaries = torch.linspace(0, 1, n_bins + 1)
