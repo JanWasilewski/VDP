@@ -6,6 +6,8 @@ import torch
 from torch.utils.data import DataLoader, Subset
 import time
 import random
+import pandas as pd
+from IPython.display import display
 
 # Evaluate on OOD and adversarial attacks
 # -------- OOD --------
@@ -20,7 +22,7 @@ import random
 # - FGSM
 # - PGD
 
-def compare_models(models, id_loader, ood_loader, deterministic_idxs=[], noise_strengths=[0.01], device="cpu"):
+def compare_models(models, id_loader, ood_loader, deterministic_idxs=[], noise_strengths=[0.01], num_to_attack=2000, device="cpu"):
         ood_list = []
         calibration_list = []
         gaussian_noise_list = []
@@ -38,8 +40,35 @@ def compare_models(models, id_loader, ood_loader, deterministic_idxs=[], noise_s
             calibration_list.append((ece, brier))
             gaussian_noise_list.append(gaussian_noise)
             print(f"finished evaluation of {idx}th model")
-        fgsm_list = evaluate_with_adversarial_samples(models, id_loader, deterministic_idxs, noise_strengths=noise_strengths, attack_type="fgsm", device=device)
-        pgd_list = evaluate_with_adversarial_samples(models, id_loader, deterministic_idxs, noise_strengths=noise_strengths, attack_type="pgd", device=device)
+        fgsm_list = evaluate_with_adversarial_samples(models, id_loader, deterministic_idxs, noise_strengths=noise_strengths, num_to_attack=num_to_attack, attack_type="fgsm", device=device)
+        pgd_list = evaluate_with_adversarial_samples(models, id_loader, deterministic_idxs, noise_strengths=noise_strengths, num_to_attack=num_to_attack, attack_type="pgd", device=device)
+        
+        dfs_fmt, numeric_dfs = compute_top_results(ood_list)
+        styled_tables = {}
+        for metric, df_fmt in dfs_fmt.items():
+            num_df = numeric_dfs[metric]
+            def highlight_top1(row, num_df=num_df, metric=metric):
+                if row.name != "top1":
+                    return [''] * len(row)
+                vals = num_df.loc["top1"].values
+                # order indices
+                if metric in ["AUPR", "AUROC"]:
+                    order = (-vals).argsort()
+                else:  # FPR95: lowest first
+                    order = vals.argsort()
+                styles = [''] * len(vals)
+                styles[order[0]] = 'color: red'
+                styles[order[1]] = 'color: blue'
+                return styles
+
+            styled = df_fmt.style.apply(highlight_top1, axis=1)
+            styled_tables[metric] = styled
+            print(metric)
+            display(styled)
+        
+        display_robustness(gaussian_noise_list, fgsm_list, pgd_list)
+
+        print(calibration_list)
         return ood_list, calibration_list, gaussian_noise_list, fgsm_list, pgd_list
 
 def evaluate_with_adversarial_samples(
@@ -47,7 +76,7 @@ def evaluate_with_adversarial_samples(
     id_loader,
     deterministic_idxs,
     noise_strengths,
-    num_to_attack=2000,
+    num_to_attack,
     batch_size=64,
     max_trials=5,
     attack_type='fgsm', 
@@ -121,6 +150,7 @@ def evaluate_with_adversarial_samples(
 
             all_adv_examples = []
             for idx, model in enumerate(models):
+                model.train()
                 X_adv = X.clone().detach().requires_grad_(True)
                 if attack_type.lower() == 'fgsm':
                     # single‐step
@@ -425,3 +455,81 @@ def evaluate_ood(model, in_loader, ood_loader, device="cpu", vdp=True):
     return results
 
 
+def display_robustness(gaussian_list, fgsm_dict, pgm_dict):
+    epsilons = sorted({list(d.keys())[0] for d in gaussian_list})
+    Gaussian_df = pd.DataFrame(index=epsilons)
+    for i, d in enumerate(gaussian_list, start=1):
+        Gaussian_df[f"model{i}"] = [d[eps] for eps in epsilons]
+    Gaussian_df.index.name = "epsilon"
+
+    # Build FGSM DataFrame
+    epsilons = sorted(fgsm_dict.keys())
+    FGSM_df = pd.DataFrame(index=epsilons)
+    num_models = len(next(iter(fgsm_dict.values()))['robustness'])
+    for j in range(num_models):
+        FGSM_df[f"model{j+1}"] = [np.mean(fgsm_dict[eps]['robustness'][j]) for eps in epsilons]
+    FGSM_df.index.name = "epsilon"
+
+    # Build PGM DataFrame
+    epsilons = sorted(pgm_dict.keys())
+    PGM_df = pd.DataFrame(index=epsilons)
+    num_models = len(next(iter(pgm_dict.values()))['robustness'])
+    for j in range(num_models):
+        PGM_df[f"model{j+1}"] = [np.mean(pgm_dict[eps]['robustness'][j]) for eps in epsilons]
+    PGM_df.index.name = "epsilon"
+
+    # Styling function: highlight highest in red, second-highest in blue per row
+    def style_df_highlights(df):
+        def highlight_row(row):
+            vals = row.values.astype(float)
+            order = (-vals).argsort()  # descending for highest first
+            styles = [''] * len(vals)
+            if len(vals) > 0:
+                styles[order[0]] = 'color: red'
+            if len(vals) > 1:
+                styles[order[1]] = 'color: blue'
+            return styles
+        return df.style.apply(highlight_row, axis=1)
+
+    # Apply styling and display
+    styled_Gaussian = style_df_highlights(Gaussian_df)
+    styled_FGSM = style_df_highlights(FGSM_df)
+    styled_PGM = style_df_highlights(PGM_df)
+
+    print("Gaussian")
+    display(styled_Gaussian)
+
+    print("FGSM")
+    display(styled_FGSM)
+
+    print("PGM")
+    display(styled_PGM)
+
+
+def compute_top_results(results_list, top_n=3, fmt="{:.4f} ({})"):
+    metrics = ["aupr", "auroc", "fpr95"]
+    orders = {m: (True if m == "fpr95" else False) for m in metrics}
+    dfs_fmt = {}
+    numeric_dfs = {}
+    for m in metrics:
+        asc = orders[m]
+        idx = [f"top{i+1}" for i in range(top_n)]
+        df_fmt = pd.DataFrame(index=idx)
+        df_num = pd.DataFrame(index=idx)
+        for i, res in enumerate(results_list, start=1):
+            pairs = [(float(v), k.rsplit("_",1)[0]) 
+                     for k, v in res.items() if k.endswith(f"_{m}")]
+            sorted_pairs = sorted(pairs, key=lambda x: x[0], reverse=not asc)[:top_n]
+            vals = [v for v, _ in sorted_pairs]
+            crits = [crit for _, crit in sorted_pairs]
+            # format
+            fmted = [fmt.format(v, crit) for v, crit in sorted_pairs]
+            # pad
+            while len(fmted) < top_n:
+                fmted.append("")
+                vals.append(np.nan)
+            df_fmt[f"model{i}"] = fmted
+            df_num[f"model{i}"] = vals
+        dfs_fmt[m.upper()] = df_fmt
+        numeric_dfs[m.upper()] = df_num
+    return dfs_fmt, numeric_dfs

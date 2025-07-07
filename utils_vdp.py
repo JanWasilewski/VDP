@@ -22,8 +22,25 @@ def mc_nll(mu, sigma, y_gt, num_samples=10):
     nll = -log_probs.mean()  
     return nll
 
-
 def dirichlet_loss(mu, sigma, targets, eps=1e-8, lambda_reg=0.01):
+    # 1) build strictly‐positive evidence
+    evidence    = F.softplus(mu) / (sigma + eps)      # [B, C]
+    alpha       = evidence + 1                        # [B, C]
+    alpha_0     = alpha.sum(dim=1)                    # [B]
+
+    # 2) NLL term for a single one‐hot target
+    target_oh   = F.one_hot(targets, mu.size(1)).float()
+    alpha_t     = (alpha * target_oh).sum(dim=1)      # [B]
+    main_loss   = torch.log(alpha_0 + eps) - torch.log(alpha_t + eps)
+
+    # 3) regularize only the uncertainty on the true class
+    sigma_t     = (sigma * target_oh).sum(dim=1)      # [B]
+    reg_loss    = lambda_reg * sigma_t
+
+    return (main_loss + reg_loss).mean()
+
+
+def dirichlet_loss_old2(mu, sigma, targets, eps=1e-8, lambda_reg=0.01):
     """
     mu: [B, C] - predicted mean logits
     sigma: [B, C] - predicted variance logits (uncertainty)
